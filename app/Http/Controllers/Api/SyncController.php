@@ -4,429 +4,420 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Client;
-use App\Models\Prestation;
 use App\Models\Passage;
 use App\Models\Paiement;
-use App\Models\SyncLog;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Exception;
 
 class SyncController extends Controller
 {
     /**
-     * Synchronisation par lot (batch).
-     * Reçoit plusieurs entités à synchroniser en une seule requête.
+     * Synchroniser les données hors ligne avec le serveur.
+     * Gère la synchronisation par lots de clients, passages et paiements.
      */
-    public function batch(Request $request): JsonResponse
+    public function sync(Request $request): JsonResponse
     {
-        $validator = Validator::make($request->all(), [
-            'device_id' => 'required|string',
-            'data' => 'required|array',
-            'data.clients' => 'sometimes|array',
-            'data.prestations' => 'sometimes|array',
-            'data.passages' => 'sometimes|array',
-            'data.paiements' => 'sometimes|array',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'errors' => $validator->errors(),
-            ], 422);
-        }
-
-        $deviceId = $request->device_id;
-        $data = $request->data;
-        $results = [
-            'clients' => [],
-            'prestations' => [],
-            'passages' => [],
-            'paiements' => [],
-        ];
-
+        DB::beginTransaction();
+        
         try {
-            DB::beginTransaction();
+            $validator = Validator::make($request->all(), [
+                'sync_data' => 'required|array',
+                'sync_data.*.entity' => 'required|in:clients,passages,paiements',
+                'sync_data.*.action' => 'required|in:create,update,delete',
+                'sync_data.*.data' => 'required|array',
+                'sync_data.*.temp_id' => 'sometimes|string',
+                'sync_data.*.local_id' => 'sometimes|integer',
+            ]);
 
-            // Synchroniser les clients
-            if (isset($data['clients'])) {
-                $results['clients'] = $this->syncClients($data['clients'], $deviceId);
+            if ($validator->fails()) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'errors' => $validator->errors(),
+                ], 422);
             }
 
-            // Synchroniser les prestations
-            if (isset($data['prestations'])) {
-                $results['prestations'] = $this->syncPrestations($data['prestations'], $deviceId);
-            }
+            $syncData = $request->input('sync_data');
+            $results = [
+                'success' => [],
+                'failed' => [],
+            ];
 
-            // Synchroniser les passages
-            if (isset($data['passages'])) {
-                $results['passages'] = $this->syncPassages($data['passages'], $deviceId);
-            }
+            // Trier les données par ordre de dépendance
+            // Clients d'abord, puis passages, puis paiements
+            usort($syncData, function($a, $b) {
+                $order = ['clients' => 1, 'passages' => 2, 'paiements' => 3];
+                return ($order[$a['entity']] ?? 999) - ($order[$b['entity']] ?? 999);
+            });
 
-            // Synchroniser les paiements
-            if (isset($data['paiements'])) {
-                $results['paiements'] = $this->syncPaiements($data['paiements'], $deviceId);
+            foreach ($syncData as $index => $item) {
+                try {
+                    $result = $this->syncItem($item);
+                    $results['success'][] = [
+                        'index' => $index,
+                        'entity' => $item['entity'],
+                        'action' => $item['action'],
+                        'temp_id' => $item['temp_id'] ?? null,
+                        'result' => $result,
+                    ];
+                } catch (Exception $e) {
+                    Log::error('Erreur synchronisation item', [
+                        'item' => $item,
+                        'error' => $e->getMessage(),
+                    ]);
+                    
+                    $results['failed'][] = [
+                        'index' => $index,
+                        'entity' => $item['entity'],
+                        'action' => $item['action'],
+                        'temp_id' => $item['temp_id'] ?? null,
+                        'error' => $e->getMessage(),
+                    ];
+                }
             }
 
             DB::commit();
 
             return response()->json([
                 'success' => true,
-                'message' => 'Synchronisation effectuée avec succès',
+                'message' => sprintf(
+                    'Synchronisation terminée: %d réussie(s), %d échouée(s)',
+                    count($results['success']),
+                    count($results['failed'])
+                ),
                 'data' => $results,
-                'timestamp' => now()->toIso8601String(),
             ]);
 
-        } catch (\Exception $e) {
+        } catch (Exception $e) {
             DB::rollBack();
-
+            Log::error('Erreur synchronisation globale: ' . $e->getMessage());
+            
             return response()->json([
                 'success' => false,
-                'message' => 'Erreur lors de la synchronisation',
-                'error' => $e->getMessage(),
+                'message' => 'Erreur lors de la synchronisation: ' . $e->getMessage(),
             ], 500);
         }
     }
 
     /**
-     * Synchroniser les clients.
+     * Synchroniser un élément individuel.
      */
-    protected function syncClients(array $clients, string $deviceId): array
+    private function syncItem(array $item): array
     {
-        $results = [];
+        $entity = $item['entity'];
+        $action = $item['action'];
+        $data = $item['data'];
 
-        foreach ($clients as $clientData) {
-            try {
-                $localId = $clientData['local_id'] ?? null;
-                $action = $clientData['action'] ?? 'create';
+        switch ($entity) {
+            case 'clients':
+                return $this->syncClient($action, $data, $item);
+            case 'passages':
+                return $this->syncPassage($action, $data, $item);
+            case 'paiements':
+                return $this->syncPaiement($action, $data, $item);
+            default:
+                throw new Exception("Type d'entité non supporté: {$entity}");
+        }
+    }
 
-                if ($action === 'create') {
-                    // Vérifier si le client existe déjà par téléphone
-                    $existingClient = Client::where('telephone', $clientData['telephone'])->first();
+    /**
+     * Synchroniser un client.
+     */
+    private function syncClient(string $action, array $data, array $item): array
+    {
+        if ($action === 'create') {
+            // Vérifier si un client avec ce téléphone existe déjà
+            $existingClient = null;
+            if (!empty($data['telephone'])) {
+                $existingClient = Client::where('telephone', $data['telephone'])->first();
+            }
+
+            if ($existingClient) {
+                // Client existe déjà, retourner ses informations
+                return [
+                    'action' => 'found_existing',
+                    'server_id' => $existingClient->id,
+                    'client' => $existingClient,
+                    'message' => 'Client existant trouvé avec ce téléphone',
+                ];
+            }
+
+            // Créer le nouveau client
+            $validator = Validator::make($data, [
+                'nom' => 'required|string|max:100',
+                'prenom' => 'required|string|max:100',
+                'telephone' => 'nullable|string|max:20',
+            ]);
+
+            if ($validator->fails()) {
+                throw new Exception('Données client invalides: ' . json_encode($validator->errors()));
+            }
+
+            // Générer un code client unique
+            $year = date('y');
+            $maxNumber = DB::table('clients')
+                ->select(DB::raw('COALESCE(MAX(CAST(SUBSTRING(code_client, 2, 3) AS UNSIGNED)), 0) as max_num'))
+                ->whereNotNull('code_client')
+                ->where('code_client', 'REGEXP', '^C[0-9]{3}-[0-9]{2}$')
+                ->value('max_num');
+            
+            $nextNumber = $maxNumber + 1;
+            $codeClient = sprintf('C%03d-%s', $nextNumber, $year);
+
+            $client = Client::create([
+                'nom' => $data['nom'],
+                'prenom' => $data['prenom'],
+                'telephone' => $data['telephone'] ?? null,
+                'code_client' => $codeClient,
+                'nombre_passages' => 0,
+                'synced_at' => now(),
+            ]);
+
+            return [
+                'action' => 'created',
+                'server_id' => $client->id,
+                'client' => $client,
+            ];
+
+        } elseif ($action === 'update') {
+            $serverId = $item['server_id'] ?? null;
+            
+            if (!$serverId) {
+                throw new Exception('ID serveur manquant pour la mise à jour');
+            }
+
+            $client = Client::findOrFail($serverId);
+            
+            $client->update([
+                'nom' => $data['nom'] ?? $client->nom,
+                'prenom' => $data['prenom'] ?? $client->prenom,
+                'telephone' => $data['telephone'] ?? $client->telephone,
+                'synced_at' => now(),
+            ]);
+
+            return [
+                'action' => 'updated',
+                'server_id' => $client->id,
+                'client' => $client,
+            ];
+        }
+
+        throw new Exception("Action non supportée pour les clients: {$action}");
+    }
+
+    /**
+     * Synchroniser un passage.
+     * ✅ AMÉLIORATION : Accepte les deux formats de prestations (id et prestation_id)
+     */
+    private function syncPassage(string $action, array $data, array $item): array
+    {
+        if ($action === 'create') {
+            // ✅ NOUVEAU : Validation flexible pour accepter 'id' OU 'prestation_id'
+            $validator = Validator::make($data, [
+                'client_id' => 'required|exists:clients,id',
+                'date_passage' => 'required|date',
+                'est_gratuit' => 'required|boolean',
+                'montant_total' => 'required|numeric|min:0',
+                'prestations' => 'required|array|min:1',
+                'prestations.*.quantite' => 'required|integer|min:1',
+                'prestations.*.prix_unitaire' => 'required|numeric|min:0',
+                'prestations.*.coiffeur_id' => 'nullable|exists:users,id',
+            ], [
+                'prestations.required' => 'Au moins une prestation est requise',
+                'prestations.*.quantite.required' => 'La quantité est requise pour chaque prestation',
+                'prestations.*.prix_unitaire.required' => 'Le prix unitaire est requis pour chaque prestation',
+            ]);
+
+            if ($validator->fails()) {
+                throw new Exception('Données passage invalides: ' . json_encode($validator->errors()));
+            }
+
+            // ✅ NOUVEAU : Valider que chaque prestation a soit 'id' soit 'prestation_id'
+            foreach ($data['prestations'] as $index => $prestationData) {
+                if (!isset($prestationData['id']) && !isset($prestationData['prestation_id'])) {
+                    throw new Exception("La prestation à l'index {$index} doit avoir un champ 'id' ou 'prestation_id'");
+                }
+                
+                // Vérifier que l'ID existe
+                $prestationId = $prestationData['id'] ?? $prestationData['prestation_id'];
+                if (!\App\Models\Prestation::where('id', $prestationId)->exists()) {
+                    throw new Exception("La prestation {$prestationId} n'existe pas");
+                }
+            }
+
+            // Créer le passage
+            $passage = Passage::create([
+                'client_id' => $data['client_id'],
+                'date_passage' => $data['date_passage'],
+                'est_gratuit' => $data['est_gratuit'],
+                'montant_total' => $data['montant_total'],
+            ]);
+
+            // ✅ AMÉLIORATION : Attacher les prestations avec support des deux formats
+            foreach ($data['prestations'] as $prestationData) {
+                // Utiliser 'id' en priorité, sinon 'prestation_id'
+                $prestationId = $prestationData['id'] ?? $prestationData['prestation_id'];
+                
+                $passage->prestations()->attach(
+                    $prestationId,
+                    [
+                        'quantite' => $prestationData['quantite'],
+                        'prix_unitaire' => $prestationData['prix_unitaire'],
+                        'coiffeur_id' => $prestationData['coiffeur_id'] ?? null,
+                    ]
+                );
+            }
+
+            // Mettre à jour le nombre de passages du client
+            $client = Client::find($data['client_id']);
+            if ($client) {
+                $client->increment('nombre_passages');
+            }
+
+            // Charger les relations
+            $passage->load(['client', 'prestations', 'paiement']);
+
+            return [
+                'action' => 'created',
+                'server_id' => $passage->id,
+                'passage' => $passage,
+            ];
+
+        } elseif ($action === 'update') {
+            $serverId = $item['server_id'] ?? null;
+            
+            if (!$serverId) {
+                throw new Exception('ID serveur manquant pour la mise à jour');
+            }
+
+            $passage = Passage::findOrFail($serverId);
+            
+            $passage->update([
+                'date_passage' => $data['date_passage'] ?? $passage->date_passage,
+                'est_gratuit' => $data['est_gratuit'] ?? $passage->est_gratuit,
+                'montant_total' => $data['montant_total'] ?? $passage->montant_total,
+            ]);
+
+            // Mettre à jour les prestations si fournies
+            if (isset($data['prestations'])) {
+                $passage->prestations()->detach();
+                
+                foreach ($data['prestations'] as $prestationData) {
+                    // ✅ Support des deux formats
+                    $prestationId = $prestationData['id'] ?? $prestationData['prestation_id'];
                     
-                    if ($existingClient) {
-                        // Conflit : client existe déjà
-                        $this->logSync($deviceId, 'client', $existingClient->id, 'create', $clientData, null, 'conflit', 'Client existe déjà');
-                        
-                        $results[] = [
-                            'local_id' => $localId,
-                            'server_id' => $existingClient->id,
-                            'status' => 'conflit',
-                            'message' => 'Client existe déjà',
-                            'data' => $existingClient,
-                        ];
-                    } else {
-                        // Créer le nouveau client
-                        $client = Client::create([
-                            'nom' => $clientData['nom'],
-                            'prenom' => $clientData['prenom'],
-                            'telephone' => $clientData['telephone'],
-                            'nombre_passages' => $clientData['nombre_passages'] ?? 0,
-                            'device_id' => $deviceId,
-                            'synced_at' => now(),
-                        ]);
-
-                        $this->logSync($deviceId, 'client', $client->id, 'create', null, $clientData, 'succes');
-
-                        $results[] = [
-                            'local_id' => $localId,
-                            'server_id' => $client->id,
-                            'status' => 'succes',
-                            'data' => $client,
-                        ];
-                    }
-                } elseif ($action === 'update') {
-                    $serverId = $clientData['server_id'];
-                    $client = Client::find($serverId);
-
-                    if ($client) {
-                        $oldData = $client->toArray();
-                        $client->update([
-                            'nom' => $clientData['nom'],
-                            'prenom' => $clientData['prenom'],
-                            'telephone' => $clientData['telephone'],
-                            'device_id' => $deviceId,
-                            'synced_at' => now(),
-                        ]);
-
-                        $this->logSync($deviceId, 'client', $client->id, 'update', $oldData, $clientData, 'succes');
-
-                        $results[] = [
-                            'local_id' => $localId,
-                            'server_id' => $client->id,
-                            'status' => 'succes',
-                            'data' => $client,
-                        ];
-                    } else {
-                        $results[] = [
-                            'local_id' => $localId,
-                            'server_id' => $serverId,
-                            'status' => 'echec',
-                            'message' => 'Client introuvable',
-                        ];
-                    }
+                    $passage->prestations()->attach(
+                        $prestationId,
+                        [
+                            'quantite' => $prestationData['quantite'],
+                            'prix_unitaire' => $prestationData['prix_unitaire'],
+                            'coiffeur_id' => $prestationData['coiffeur_id'] ?? null,
+                        ]
+                    );
                 }
-            } catch (\Exception $e) {
-                $results[] = [
-                    'local_id' => $localId ?? null,
-                    'status' => 'echec',
-                    'message' => $e->getMessage(),
-                ];
             }
+
+            $passage->load(['client', 'prestations', 'paiement']);
+
+            return [
+                'action' => 'updated',
+                'server_id' => $passage->id,
+                'passage' => $passage,
+            ];
+
+        } elseif ($action === 'delete') {
+            $serverId = $item['server_id'] ?? null;
+            
+            if (!$serverId) {
+                throw new Exception('ID serveur manquant pour la suppression');
+            }
+
+            $passage = Passage::findOrFail($serverId);
+            $clientId = $passage->client_id;
+            
+            $passage->delete();
+
+            // Mettre à jour le nombre de passages du client
+            $client = Client::find($clientId);
+            if ($client && $client->nombre_passages > 0) {
+                $client->decrement('nombre_passages');
+            }
+
+            return [
+                'action' => 'deleted',
+                'server_id' => $serverId,
+            ];
         }
 
-        return $results;
+        throw new Exception("Action non supportée pour les passages: {$action}");
     }
 
     /**
-     * Synchroniser les prestations.
+     * Synchroniser un paiement.
      */
-    protected function syncPrestations(array $prestations, string $deviceId): array
+    private function syncPaiement(string $action, array $data, array $item): array
     {
-        $results = [];
+        if ($action === 'create') {
+            $validator = Validator::make($data, [
+                'passage_id' => 'required|exists:passages,id',
+                'montant' => 'required|numeric|min:0',
+                'mode_paiement' => 'required|in:espece,carte,mobile',
+                'numero_telephone' => 'nullable|string',
+                'reference_transaction' => 'nullable|string',
+            ]);
 
-        foreach ($prestations as $prestationData) {
-            try {
-                $localId = $prestationData['local_id'] ?? null;
-                $action = $prestationData['action'] ?? 'create';
-
-                if ($action === 'create') {
-                    $prestation = Prestation::create([
-                        'libelle' => $prestationData['libelle'],
-                        'prix' => $prestationData['prix'],
-                        'description' => $prestationData['description'] ?? null,
-                        'actif' => $prestationData['actif'] ?? true,
-                        'ordre' => $prestationData['ordre'] ?? 0,
-                        'device_id' => $deviceId,
-                        'synced_at' => now(),
-                    ]);
-
-                    $this->logSync($deviceId, 'prestation', $prestation->id, 'create', null, $prestationData, 'succes');
-
-                    $results[] = [
-                        'local_id' => $localId,
-                        'server_id' => $prestation->id,
-                        'status' => 'succes',
-                        'data' => $prestation,
-                    ];
-                } elseif ($action === 'update') {
-                    $serverId = $prestationData['server_id'];
-                    $prestation = Prestation::find($serverId);
-
-                    if ($prestation) {
-                        $oldData = $prestation->toArray();
-                        $prestation->update([
-                            'libelle' => $prestationData['libelle'],
-                            'prix' => $prestationData['prix'],
-                            'description' => $prestationData['description'] ?? null,
-                            'actif' => $prestationData['actif'] ?? true,
-                            'ordre' => $prestationData['ordre'] ?? 0,
-                            'device_id' => $deviceId,
-                            'synced_at' => now(),
-                        ]);
-
-                        $this->logSync($deviceId, 'prestation', $prestation->id, 'update', $oldData, $prestationData, 'succes');
-
-                        $results[] = [
-                            'local_id' => $localId,
-                            'server_id' => $prestation->id,
-                            'status' => 'succes',
-                            'data' => $prestation,
-                        ];
-                    }
-                }
-            } catch (\Exception $e) {
-                $results[] = [
-                    'local_id' => $localId ?? null,
-                    'status' => 'echec',
-                    'message' => $e->getMessage(),
-                ];
+            if ($validator->fails()) {
+                throw new Exception('Données paiement invalides: ' . json_encode($validator->errors()));
             }
+
+            $paiement = Paiement::create([
+                'passage_id' => $data['passage_id'],
+                'montant' => $data['montant'],
+                'mode_paiement' => $data['mode_paiement'],
+                'numero_telephone' => $data['numero_telephone'] ?? null,
+                'reference_transaction' => $data['reference_transaction'] ?? null,
+                'date_paiement' => now(),
+            ]);
+
+            return [
+                'action' => 'created',
+                'server_id' => $paiement->id,
+                'paiement' => $paiement,
+            ];
         }
 
-        return $results;
+        throw new Exception("Action non supportée pour les paiements: {$action}");
     }
 
     /**
-     * Synchroniser les passages.
+     * Obtenir les statistiques de synchronisation.
      */
-    protected function syncPassages(array $passages, string $deviceId): array
+    public function syncStats(Request $request): JsonResponse
     {
-        $results = [];
+        try {
+            $stats = [
+                'total_clients' => Client::count(),
+                'clients_synced_today' => Client::whereDate('synced_at', today())->count(),
+                'total_passages' => Passage::count(),
+                'passages_today' => Passage::whereDate('date_passage', today())->count(),
+                'last_sync' => Client::max('synced_at'),
+            ];
 
-        foreach ($passages as $passageData) {
-            try {
-                $localId = $passageData['local_id'] ?? null;
-                $action = $passageData['action'] ?? 'create';
-
-                if ($action === 'create') {
-                    // Créer le passage
-                    $passage = Passage::create([
-                        'client_id' => $passageData['client_id'],
-                        'numero_passage' => $passageData['numero_passage'],
-                        'est_gratuit' => $passageData['est_gratuit'] ?? false,
-                        'notes' => $passageData['notes'] ?? null,
-                        'date_passage' => $passageData['date_passage'] ?? now(),
-                        'device_id' => $deviceId,
-                        'synced_at' => now(),
-                    ]);
-
-                    // Attacher les prestations
-                    if (isset($passageData['prestations'])) {
-                        foreach ($passageData['prestations'] as $prest) {
-                            $passage->prestations()->attach($prest['id'], [
-                                'prix_applique' => $prest['prix_applique'],
-                                'quantite' => $prest['quantite'] ?? 1,
-                            ]);
-                        }
-                    }
-
-                    $this->logSync($deviceId, 'passage', $passage->id, 'create', null, $passageData, 'succes');
-
-                    $results[] = [
-                        'local_id' => $localId,
-                        'server_id' => $passage->id,
-                        'status' => 'succes',
-                        'data' => $passage->load('prestations'),
-                    ];
-                }
-            } catch (\Exception $e) {
-                $results[] = [
-                    'local_id' => $localId ?? null,
-                    'status' => 'echec',
-                    'message' => $e->getMessage(),
-                ];
-            }
-        }
-
-        return $results;
-    }
-
-    /**
-     * Synchroniser les paiements.
-     */
-    protected function syncPaiements(array $paiements, string $deviceId): array
-    {
-        $results = [];
-
-        foreach ($paiements as $paiementData) {
-            try {
-                $localId = $paiementData['local_id'] ?? null;
-                $action = $paiementData['action'] ?? 'create';
-
-                if ($action === 'create') {
-                    $paiement = Paiement::create([
-                        'passage_id' => $paiementData['passage_id'],
-                        'montant_total' => $paiementData['montant_total'],
-                        'montant_paye' => $paiementData['montant_paye'],
-                        'mode_paiement' => $paiementData['mode_paiement'],
-                        'statut' => $paiementData['statut'] ?? 'valide',
-                        'notes' => $paiementData['notes'] ?? null,
-                        'date_paiement' => $paiementData['date_paiement'] ?? now(),
-                        'device_id' => $deviceId,
-                        'synced_at' => now(),
-                    ]);
-
-                    $this->logSync($deviceId, 'paiement', $paiement->id, 'create', null, $paiementData, 'succes');
-
-                    $results[] = [
-                        'local_id' => $localId,
-                        'server_id' => $paiement->id,
-                        'status' => 'succes',
-                        'data' => $paiement,
-                    ];
-                }
-            } catch (\Exception $e) {
-                $results[] = [
-                    'local_id' => $localId ?? null,
-                    'status' => 'echec',
-                    'message' => $e->getMessage(),
-                ];
-            }
-        }
-
-        return $results;
-    }
-
-    /**
-     * Logger une opération de synchronisation.
-     */
-    protected function logSync($deviceId, $entityType, $entityId, $action, $dataBefore, $dataAfter, $statut, $messageErreur = null)
-    {
-        SyncLog::create([
-            'device_id' => $deviceId,
-            'entity_type' => $entityType,
-            'entity_id' => $entityId,
-            'action' => $action,
-            'data_before' => $dataBefore,
-            'data_after' => $dataAfter,
-            'statut' => $statut,
-            'message_erreur' => $messageErreur,
-            'date_sync' => now(),
-        ]);
-    }
-
-    /**
-     * Obtenir le statut de synchronisation.
-     */
-    public function status(Request $request): JsonResponse
-    {
-        $deviceId = $request->device_id;
-
-        if (!$deviceId) {
+            return response()->json([
+                'success' => true,
+                'data' => $stats,
+            ]);
+        } catch (Exception $e) {
+            Log::error('Erreur statistiques sync: ' . $e->getMessage());
+            
             return response()->json([
                 'success' => false,
-                'message' => 'device_id requis',
-            ], 422);
+                'message' => 'Erreur lors de la récupération des statistiques',
+            ], 500);
         }
-
-        $logs = SyncLog::byDevice($deviceId)
-            ->orderBy('date_sync', 'desc')
-            ->limit(50)
-            ->get();
-
-        $stats = [
-            'total' => $logs->count(),
-            'succes' => $logs->where('statut', 'succes')->count(),
-            'echecs' => $logs->where('statut', 'echec')->count(),
-            'conflits' => $logs->where('statut', 'conflit')->count(),
-        ];
-
-        return response()->json([
-            'success' => true,
-            'data' => [
-                'logs' => $logs,
-                'statistiques' => $stats,
-            ],
-        ]);
-    }
-
-    /**
-     * Obtenir les mises à jour depuis le serveur.
-     */
-    public function pull(Request $request): JsonResponse
-    {
-        $timestamp = $request->timestamp;
-
-        if (!$timestamp) {
-            return response()->json([
-                'success' => false,
-                'message' => 'timestamp requis',
-            ], 422);
-        }
-
-        $data = [
-            'clients' => Client::where('synced_at', '>', $timestamp)->get(),
-            'prestations' => Prestation::where('synced_at', '>', $timestamp)->get(),
-            'passages' => Passage::with('prestations')->where('synced_at', '>', $timestamp)->get(),
-            'paiements' => Paiement::where('synced_at', '>', $timestamp)->get(),
-        ];
-
-        return response()->json([
-            'success' => true,
-            'data' => $data,
-            'timestamp' => now()->toIso8601String(),
-        ]);
     }
 }

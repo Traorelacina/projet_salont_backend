@@ -91,8 +91,15 @@ Route::prefix('users')->group(function () {
         Route::post('/', [ClientController::class, 'store']);
         Route::get('/{id}', [ClientController::class, 'show']);
         Route::put('/{id}', [ClientController::class, 'update']);
-        Route::delete('/{id}', [ClientController::class, 'destroy']);
+      
         Route::get('/{id}/historique', [ClientController::class, 'historique']);
+
+        Route::delete('/{id}', [ClientController::class, 'destroy']); // Suppression définitive
+    
+    // Nouvelles routes
+    Route::post('/{id}/archive', [ClientController::class, 'archive']); // Soft delete
+    Route::post('/{id}/restore', [ClientController::class, 'restore']); // Restaurer
+    Route::get('/archived/list', [ClientController::class, 'archived']); // Liste archivés
     });
 
     // ============================================
